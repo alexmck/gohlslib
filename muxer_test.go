@@ -2776,3 +2776,191 @@ func TestMuxerPreloadHint(t *testing.T) {
 		}},
 	}}, parts)
 }
+
+func TestMuxerStablePartTarget(t *testing.T) {
+	var encodeErrors []error
+
+	m := &Muxer{
+		Variant:            MuxerVariantLowLatency,
+		SegmentCount:       7,
+		SegmentMinDuration: 2 * time.Second,
+		PartMinDuration:    500 * time.Millisecond,
+		Tracks:             []*Track{testVideoTrack},
+		OnEncodeError: func(err error) {
+			encodeErrors = append(encodeErrors, err)
+		},
+	}
+
+	err := m.Start()
+	require.NoError(t, err)
+	defer m.Close()
+
+	partTargetRe := regexp.MustCompile(`#EXT-X-PART-INF:PART-TARGET=([0-9.]+)\n`)
+	partDurationRe := regexp.MustCompile(`#EXT-X-PART:DURATION=([0-9.]+),`)
+
+	var partTargets []string
+	partDurations := make(map[string]struct{})
+
+	for i := range 300 {
+		// frame 75 would open the second part of the second segment.
+		// dropping it makes the previous sample last two frames.
+		if i == 75 {
+			continue
+		}
+
+		au := [][]byte{{1}} // non-IDR
+		if i%60 == 0 {
+			au = [][]byte{
+				testH264SPS, // SPS
+				{8},         // PPS
+				{5},         // IDR
+			}
+		}
+
+		err = m.WriteH264(testVideoTrack, testTime, int64(i)*90000/30, au)
+		require.NoError(t, err)
+
+		if i <= 60 {
+			continue
+		}
+
+		byts, _, err2 := doRequest(m, "video1_stream.m3u8")
+		require.NoError(t, err2)
+
+		partTargets = append(partTargets, partTargetRe.FindStringSubmatch(string(byts))[1])
+
+		for _, ma := range partDurationRe.FindAllStringSubmatch(string(byts), -1) {
+			partDurations[ma[1]] = struct{}{}
+		}
+	}
+
+	for _, v := range partTargets {
+		require.Equal(t, "0.50000", v)
+	}
+
+	// the part that would have contained the long sample is cut early.
+	require.Contains(t, partDurations, "0.46667")
+
+	for v := range partDurations {
+		d, err2 := strconv.ParseFloat(v, 64)
+		require.NoError(t, err2)
+		require.LessOrEqual(t, d, 0.5)
+	}
+
+	require.Empty(t, encodeErrors)
+}
+
+func TestMuxerStablePartTargetAudio(t *testing.T) {
+	m := &Muxer{
+		Variant:            MuxerVariantLowLatency,
+		SegmentCount:       7,
+		SegmentMinDuration: 2 * time.Second,
+		PartMinDuration:    500 * time.Millisecond,
+		Tracks:             []*Track{testVideoTrack, testAudioTrack},
+	}
+
+	err := m.Start()
+	require.NoError(t, err)
+	defer m.Close()
+
+	videoCount := 0
+	audioCount := 0
+
+	for videoCount < 300 {
+		videoTime := time.Duration(videoCount) * time.Second / 30
+		audioTime := time.Duration(audioCount) * 1024 * time.Second / 44100
+
+		if audioTime <= videoTime {
+			err = m.WriteMPEG4Audio(testAudioTrack, testTime,
+				int64(audioCount)*1024,
+				[][]byte{{1, 2, 3, 4}})
+			require.NoError(t, err)
+			audioCount++
+			continue
+		}
+
+		// frame 120 is dropped and the next frame is an IDR,
+		// therefore the part is switched twice within the same video sample.
+		if videoCount != 120 {
+			au := [][]byte{{1}} // non-IDR
+			if videoCount%60 == 0 || videoCount == 121 {
+				au = [][]byte{
+					testH264SPS, // SPS
+					{8},         // PPS
+					{5},         // IDR
+				}
+			}
+
+			err = m.WriteH264(testVideoTrack, testTime, int64(videoCount)*90000/30, au)
+			require.NoError(t, err)
+		}
+
+		videoCount++
+	}
+
+	byts, _, err := doRequest(m, "audio2_stream.m3u8")
+	require.NoError(t, err)
+
+	partURIs := regexp.MustCompile(`#EXT-X-PART:DURATION=[0-9.]+,URI="(.*?)"`).
+		FindAllStringSubmatch(string(byts), -1)
+	require.NotEmpty(t, partURIs)
+
+	for _, ma := range partURIs {
+		byts, _, err = doRequest(m, ma[1])
+		require.NoError(t, err)
+
+		var parts fmp4.Parts
+		err = parts.Unmarshal(byts)
+		require.NoError(t, err)
+
+		sampleCount := 0
+		for _, part := range parts {
+			for _, track := range part.Tracks {
+				sampleCount += len(track.Samples)
+			}
+		}
+		require.NotZero(t, sampleCount, ma[1])
+	}
+}
+
+func TestMuxerStablePartTargetFirstSegment(t *testing.T) {
+	var encodeErrors []error
+
+	m := &Muxer{
+		Variant:            MuxerVariantLowLatency,
+		SegmentCount:       7,
+		SegmentMinDuration: 2 * time.Second,
+		PartMinDuration:    200 * time.Millisecond,
+		Tracks:             []*Track{testVideoTrack},
+		OnEncodeError: func(err error) {
+			encodeErrors = append(encodeErrors, err)
+		},
+	}
+
+	err := m.Start()
+	require.NoError(t, err)
+	defer m.Close()
+
+	for i := range 70 {
+		// frame 12 would open the third part of the first segment.
+		// the second part is switched early and is shorter than 85% of the part target duration.
+		if i == 12 {
+			continue
+		}
+
+		au := [][]byte{{1}} // non-IDR
+		if i%60 == 0 {
+			au = [][]byte{
+				testH264SPS, // SPS
+				{8},         // PPS
+				{5},         // IDR
+			}
+		}
+
+		err = m.WriteH264(testVideoTrack, testTime, int64(i)*90000/30, au)
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, []error{fmt.Errorf("part duration (166.666666ms) is less than 85%% " +
+		"of part target duration (200ms) - this will cause an error in iOS clients")}, encodeErrors)
+}

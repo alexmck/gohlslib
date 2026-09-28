@@ -564,6 +564,19 @@ func (s *muxerSegmenter) fmp4WriteSample(
 
 	if track.isLeading {
 		s.fmp4AdjustPartDuration(timestampToDuration(int64(sample.Duration), track.ClockRate))
+
+		// switch part before the sample if it would make the part exceed the part target duration
+		if s.variant == MuxerVariantLowLatency {
+			dts := timestampToDuration(sample.dts, track.ClockRate)
+			if dts > track.stream.nextPart.startDTS &&
+				(timestampToDuration(track.fmp4NextSample.dts, track.ClockRate)-
+					track.stream.nextPart.startDTS) > s.fmp4AdjustedPartDuration {
+				err := s.parent.rotateParts(dts)
+				if err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	err := track.stream.nextPart.writeSample(
